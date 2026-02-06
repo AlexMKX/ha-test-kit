@@ -1,0 +1,36 @@
+ARG PYTHON_VERSION=3.13
+FROM python:${PYTHON_VERSION}-slim
+
+ARG HA_VERSION=2026.1.3
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip
+
+RUN python -m pip install \
+      "homeassistant==${HA_VERSION}" \
+      pytest \
+      pytest-asyncio \
+      requests \
+      websockets \
+      playwright
+
+RUN python -m playwright install --with-deps chromium
+
+COPY ha_test_kit /opt/ha_test_kit/ha_test_kit
+COPY sitecustomize.py /opt/ha_test_kit/sitecustomize.py
+
+ENV PYTHONPATH=/opt/ha_test_kit
+
+WORKDIR /work
+
+ENTRYPOINT ["python", "-m", "ha_test_kit.autoqa"]
