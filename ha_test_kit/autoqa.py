@@ -55,6 +55,48 @@ def _normalize_base_url(url: str) -> str:
     return url
 
 
+def _install_component_requirements(work_dir: Path) -> None:
+    if not _env_bool("AUTOQA_INSTALL_COMPONENT_REQUIREMENTS", default=True):
+        return
+
+    cc_dir = work_dir / "custom_components"
+    if not cc_dir.is_dir():
+        return
+
+    reqs: set[str] = set()
+    for domain_dir in sorted(cc_dir.iterdir()):
+        manifest_path = domain_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read {manifest_path}: {exc}") from exc
+
+        raw_reqs = manifest.get("requirements")
+        if isinstance(raw_reqs, list):
+            for item in raw_reqs:
+                if isinstance(item, str) and item.strip():
+                    reqs.add(item.strip())
+
+    if not reqs:
+        return
+
+    args = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-input",
+        "--no-cache-dir",
+        *sorted(reqs),
+    ]
+
+    _log("Installing component requirements: " + " ".join(sorted(reqs)))
+    subprocess.run(args, check=True)
+
+
 def _wait_for_ha_ready(base_url: str, timeout_s: int = 180) -> None:
     base_url = _normalize_base_url(base_url)
     deadline = time.time() + timeout_s
@@ -115,18 +157,16 @@ def _seed_ha_configuration(ha_config_dir: Path, work_dir: Path) -> None:
     force = _env_bool("AUTOQA_FORCE_SEED", default=False)
 
     if not dst_cfg.exists() or force:
-        src_cfg = work_dir / "tests" / "ha_config" / "configuration.yaml"
-        if not src_cfg.exists():
-            # Fallback: search in per-component test dirs
-            cc_dir = work_dir / "custom_components"
-            if cc_dir.is_dir():
-                for domain_dir in sorted(cc_dir.iterdir()):
-                    candidate = domain_dir / "tests" / "ha_config" / "configuration.yaml"
-                    if candidate.exists():
-                        src_cfg = candidate
-                        break
+        src_cfg: Path | None = None
+        cc_dir = work_dir / "custom_components"
+        if cc_dir.is_dir():
+            for domain_dir in sorted(cc_dir.iterdir()):
+                candidate = domain_dir / "tests" / "ha_config" / "configuration.yaml"
+                if candidate.exists():
+                    src_cfg = candidate
+                    break
 
-        if src_cfg.exists():
+        if src_cfg and src_cfg.exists():
             shutil.copyfile(src_cfg, dst_cfg)
             _log(f"Seeded configuration.yaml from {src_cfg}")
         else:
@@ -160,10 +200,6 @@ def _seed_ha_configuration(ha_config_dir: Path, work_dir: Path) -> None:
 
     # Autodiscover .storage dirs from multiple locations
     storage_dirs: list[Path] = []
-    legacy_storage = work_dir / "tests" / "ha_config" / ".storage"
-    if legacy_storage.is_dir():
-        storage_dirs.append(legacy_storage)
-
     cc_dir = work_dir / "custom_components"
     if cc_dir.is_dir():
         for domain_dir in sorted(cc_dir.iterdir()):
@@ -369,25 +405,46 @@ async def _ws_create_long_lived_token(
             raise RuntimeError(f"Websocket auth failed: {auth_result}")
 
         req_id = 1
-        await ws.send(
-            json.dumps(
-                {
-                    "id": req_id,
-                    "type": "auth/long_lived_access_token",
-                    "client_name": client_name,
-                    "lifespan": lifespan_days,
-                }
+        last_result: dict[str, object] | None = None
+        for attempt in range(6):
+            actual_client_name = (
+                client_name
+                if attempt == 0
+                else f"{client_name}-{int(time.time())}-{attempt}"
             )
-        )
-        token_result = json.loads(await ws.recv())
-        if not token_result.get("success"):
+
+            await ws.send(
+                json.dumps(
+                    {
+                        "id": req_id,
+                        "type": "auth/long_lived_access_token",
+                        "client_name": actual_client_name,
+                        "lifespan": lifespan_days,
+                    }
+                )
+            )
+            token_result = json.loads(await ws.recv())
+            last_result = token_result
+
+            if token_result.get("success"):
+                token = token_result.get("result")
+                if not token:
+                    raise RuntimeError(f"LLAT result missing: {token_result}")
+                if actual_client_name != client_name:
+                    _log(f"LLAT created with fallback client_name={actual_client_name!r}")
+                return str(token)
+
+            if attempt < 5:
+                _log(
+                    "LLAT creation failed; retrying with different client_name: "
+                    + str(token_result)
+                )
+                req_id += 1
+                continue
+
             raise RuntimeError(f"LLAT creation failed: {token_result}")
 
-        token = token_result.get("result")
-        if not token:
-            raise RuntimeError(f"LLAT result missing: {token_result}")
-
-        return str(token)
+        raise RuntimeError(f"LLAT creation failed: {last_result}")
 
 
 def _discover_pytest_paths(work_dir: Path) -> list[str]:
@@ -395,9 +452,6 @@ def _discover_pytest_paths(work_dir: Path) -> list[str]:
         return shlex.split(override)
 
     paths: list[Path] = []
-    if (work_dir / "tests").exists():
-        paths.append(work_dir / "tests")
-
     cc_dir = work_dir / "custom_components"
     if cc_dir.is_dir():
         for domain_dir in sorted(cc_dir.iterdir()):
@@ -405,10 +459,25 @@ def _discover_pytest_paths(work_dir: Path) -> list[str]:
             if tests_dir.is_dir():
                 paths.append(tests_dir)
 
+    global_tests = work_dir / "tests"
+    if global_tests.is_dir():
+        paths.append(global_tests)
+
     return [str(p) for p in paths]
 
 
 def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
+    work_dir = Path(os.environ.get("AUTOQA_WORK_DIR", "/work"))
+
+    config_path: Path | None = None
+    if (override := os.environ.get("AUTOQA_PYTEST_CONFIG")):
+        candidate = Path(override)
+        config_path = candidate if candidate.is_absolute() else (work_dir / candidate)
+    else:
+        candidate = work_dir / "ha-test-kit" / "pyproject.toml"
+        if candidate.exists():
+            config_path = candidate
+
     args = [
         sys.executable,
         "-m",
@@ -416,10 +485,21 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
         "-q",
         "-o",
         "cache_dir=/tmp/pytest_cache",
-        "-o",
-        "asyncio_mode=auto",
         "--basetemp=/tmp/pytest_basetemp",
+        "--rootdir",
+        str(work_dir),
     ]
+
+    if config_path is not None and config_path.exists():
+        args += ["-c", str(config_path)]
+    else:
+        # Keep behavior consistent even when no config is present in the consuming repo.
+        args += [
+            "-o",
+            "asyncio_mode=auto",
+            "-o",
+            "asyncio_default_fixture_loop_scope=session",
+        ]
 
     if mode == "unit":
         args += ["-m", "not docker_e2e"]
@@ -440,7 +520,6 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
     if (extra_args := os.environ.get("AUTOQA_PYTEST_ARGS")):
         args += shlex.split(extra_args)
 
-    work_dir = Path(os.environ.get("AUTOQA_WORK_DIR", "/work"))
     paths = _discover_pytest_paths(work_dir)
     if not paths:
         raise RuntimeError(f"No pytest paths discovered under {work_dir}")
@@ -459,6 +538,14 @@ def main() -> int:
     mode = os.environ.get("AUTOQA_MODE", "unit").strip().lower()
 
     work_dir = Path(os.environ.get("AUTOQA_WORK_DIR", "/work"))
+
+    _install_component_requirements(work_dir)
+
+    if mode == "seed":
+        ha_config_dir = Path(os.environ.get("HA_CONFIG_DIR", "/ha_config"))
+        _seed_ha_configuration(ha_config_dir, work_dir)
+        _touch_ready_flag(ha_config_dir)
+        return 0
 
     if mode == "e2e":
         ha_config_dir = Path(os.environ.get("HA_CONFIG_DIR", "/ha_config"))

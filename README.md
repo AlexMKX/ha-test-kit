@@ -103,28 +103,33 @@ This repo’s Docker E2E tests follow that convention.
 
 ## Directory layout
 
-- `ha-test-kit/Dockerfile.autoqa`
+All files below live inside the `ha-test-kit/` directory (the submodule):
+
+- `Dockerfile.autoqa`
   - Builds a slim Python image with Home Assistant + pytest tooling.
   - Entrypoint: `python -m ha_test_kit.autoqa`.
 
-- `ha-test-kit/sitecustomize.py`
+- `sitecustomize.py`
   - Ensures there is a current asyncio event loop.
   - This helps avoid runtime issues in some environments/tools.
 
-- `ha-test-kit/ha_test_kit/autoqa.py`
+- `ha_test_kit/autoqa.py`
   - The harness logic.
 
-- `docker-compose.e2e.yml` (repo root)
-  - Brings up two services:
+- `docker-compose.yml`
+  - Generic E2E compose bringing up two services:
     - `autoqa`: the test runner container.
     - `homeassistant`: HA container.
   - Uses a shared volume for `/ha_config`.
+  - All relative paths resolve from the consuming project's root via `--project-directory`.
 
-- `run_unit.sh` (repo root)
+- `run_unit.sh`
   - Builds the `autoqa` image and runs **unit mode**.
+  - Auto-detects project root as `..` (overridable via `PROJECT_ROOT`).
 
-- `run_e2e.sh` (repo root)
+- `run_e2e.sh`
   - Runs Docker Compose E2E stack and exits with the test runner exit code.
+  - Auto-detects project root as `..` (overridable via `PROJECT_ROOT`).
 
 ---
 
@@ -135,20 +140,21 @@ This repo’s Docker E2E tests follow that convention.
 From repo root:
 
 ```bash
-./run_unit.sh
+./ha-test-kit/run_unit.sh
 ```
 
 Optional overrides:
 
 - `AUTOQA_TEST_PATHS` — override which paths are passed to pytest.
 - `AUTOQA_PYTEST_ARGS` — extra pytest args.
+- `PROJECT_ROOT` — override auto-detected project root.
 
 Examples:
 
 ```bash
-AUTOQA_TEST_PATHS="custom_components/automation_run_switch/tests" ./run_unit.sh
+AUTOQA_TEST_PATHS="custom_components/automation_run_switch/tests" ./ha-test-kit/run_unit.sh
 
-AUTOQA_PYTEST_ARGS="-k automation_run_switch -vv" ./run_unit.sh
+AUTOQA_PYTEST_ARGS="-k automation_run_switch -vv" ./ha-test-kit/run_unit.sh
 ```
 
 ### E2E tests (Home Assistant in Docker + autoqa runner)
@@ -156,17 +162,17 @@ AUTOQA_PYTEST_ARGS="-k automation_run_switch -vv" ./run_unit.sh
 From repo root:
 
 ```bash
-./run_e2e.sh
+./ha-test-kit/run_e2e.sh
 ```
 
 Optional overrides:
 
 ```bash
-HA_VERSION=2026.1.3 ./run_e2e.sh
+HA_VERSION=2026.1.3 ./ha-test-kit/run_e2e.sh
 
-AUTOQA_TEST_PATHS="tests/test_e2e_dimmer_valve.py" ./run_e2e.sh
+AUTOQA_TEST_PATHS="tests/test_e2e_dimmer_valve.py" ./ha-test-kit/run_e2e.sh
 
-AUTOQA_PYTEST_ARGS="-vv --maxfail=1" ./run_e2e.sh
+AUTOQA_PYTEST_ARGS="-vv --maxfail=1" ./ha-test-kit/run_e2e.sh
 ```
 
 ---
@@ -237,7 +243,7 @@ AUTOQA_PYTEST_ARGS="-vv --maxfail=1" ./run_e2e.sh
 3) Run E2E locally:
 
 ```bash
-AUTOQA_TEST_PATHS="path/to/your/test_file.py" ./run_e2e.sh
+AUTOQA_TEST_PATHS="path/to/your/test_file.py" ./ha-test-kit/run_e2e.sh
 ```
 
 ---
@@ -271,4 +277,4 @@ If you copy `.storage` manually, you can break onboarding/auth flows.
 - The harness is intentionally **stringly-typed** via env vars; do not hardcode tokens.
 - E2E token provisioning is a part of the contract: tests should consume `HASS_LONG_LIVED_TOKEN`.
 - Package autodiscovery is the preferred way to configure HA for tests; avoid editing the container’s config in tests.
-- Project mount is read-only in both `run_unit.sh` and `docker-compose.e2e.yml` (`/work:ro`).
+- Project mount is read-only in both `run_unit.sh` and `docker-compose.yml` (`/work:ro`).

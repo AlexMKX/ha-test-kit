@@ -1,0 +1,64 @@
+# Generic Docker Compose for E2E tests via ha-test-kit.
+# Invoked from run_e2e.sh with --project-directory set to the repo root,
+# so all relative paths resolve from the consuming project's root.
+
+services:
+  seed:
+    build:
+      context: ./ha-test-kit
+      dockerfile: Dockerfile.autoqa
+      args:
+        HA_VERSION: ${HA_VERSION:-2025.1.3}
+    volumes:
+      - .:/work:ro
+      - ha_config:/ha_config
+    environment:
+      - AUTOQA_MODE=seed
+      - HA_CONFIG_DIR=/ha_config
+      - AUTOQA_FORCE_SEED=true
+      - PYTHONUNBUFFERED=1
+    networks:
+      - e2e_network
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:${HA_VERSION:-2025.1.3}
+    restart: "no"
+    volumes:
+      - ha_config:/config
+      - ./custom_components:/config/custom_components:ro
+    environment:
+      - TZ=UTC
+    networks:
+      - e2e_network
+
+  autoqa:
+    build:
+      context: ./ha-test-kit
+      dockerfile: Dockerfile.autoqa
+      args:
+        HA_VERSION: ${HA_VERSION:-2025.1.3}
+    depends_on:
+      - homeassistant
+    volumes:
+      - .:/work:ro
+      - ha_config:/ha_config
+      - ./.autoqa/test_results:/test_results
+      - ./.autoqa/screenshots:/screenshots
+    environment:
+      - AUTOQA_MODE=e2e
+      - HA_BASE_URL=http://homeassistant:8123
+      - HA_CONFIG_DIR=/ha_config
+      - AUTOQA_FORCE_SEED=true
+      - AUTOQA_PYTEST_CONFIG=ha-test-kit/pyproject.toml
+      - AUTOQA_PYTEST_ARGS=${AUTOQA_PYTEST_ARGS:-}
+      - AUTOQA_TEST_PATHS=${AUTOQA_TEST_PATHS:-}
+      - PYTHONUNBUFFERED=1
+    networks:
+      - e2e_network
+
+networks:
+  e2e_network:
+    driver: bridge
+
+volumes:
+  ha_config:
