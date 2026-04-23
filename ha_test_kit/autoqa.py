@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -121,6 +121,7 @@ def _wait_for_ha_ready(base_url: str, timeout_s: int = 180) -> None:
 # HA config seeding & package autodiscovery
 # ---------------------------------------------------------------------------
 
+
 def _discover_ha_packages(work_dir: Path) -> list[Path]:
     """Find HA package YAML files from well-known autodiscovery paths.
 
@@ -190,7 +191,7 @@ def _seed_ha_configuration(ha_config_dir: Path, work_dir: Path) -> None:
 
     # --- Copy .storage registries ------------------------------------------
     # Files that must NOT be seeded — they interfere with onboarding / auth.
-    _STORAGE_SKIP = {
+    storage_skip = {
         "auth",
         "auth_provider.homeassistant",
         "onboarding",
@@ -217,7 +218,7 @@ def _seed_ha_configuration(ha_config_dir: Path, work_dir: Path) -> None:
         for src_file in sorted(src_storage_dir.iterdir()):
             if not src_file.is_file():
                 continue
-            if src_file.name in _STORAGE_SKIP:
+            if src_file.name in storage_skip:
                 _log(f"Skipped seeding .storage/{src_file.name} (auth-related)")
                 continue
             try:
@@ -271,9 +272,7 @@ def _create_onboarding_user(
         _log(f"Onboarding unavailable (status {resp.status_code}); will use login_flow fallback")
         return None
 
-    raise RuntimeError(
-        f"Failed to create onboarding user: status={resp.status_code} body={resp.text}"
-    )
+    raise RuntimeError(f"Failed to create onboarding user: status={resp.status_code} body={resp.text}")
 
 
 def _login_flow_auth_code(
@@ -353,9 +352,7 @@ def _login_flow_auth_code(
     return str(auth_code)
 
 
-def _exchange_auth_code_for_access_token(
-    base_url: str, *, client_id: str, auth_code: str
-) -> str:
+def _exchange_auth_code_for_access_token(base_url: str, *, client_id: str, auth_code: str) -> str:
     base_url = _normalize_base_url(base_url)
 
     resp = requests.post(
@@ -407,11 +404,7 @@ async def _ws_create_long_lived_token(
         req_id = 1
         last_result: dict[str, object] | None = None
         for attempt in range(6):
-            actual_client_name = (
-                client_name
-                if attempt == 0
-                else f"{client_name}-{int(time.time())}-{attempt}"
-            )
+            actual_client_name = client_name if attempt == 0 else f"{client_name}-{int(time.time())}-{attempt}"
 
             await ws.send(
                 json.dumps(
@@ -435,10 +428,7 @@ async def _ws_create_long_lived_token(
                 return str(token)
 
             if attempt < 5:
-                _log(
-                    "LLAT creation failed; retrying with different client_name: "
-                    + str(token_result)
-                )
+                _log("LLAT creation failed; retrying with different client_name: " + str(token_result))
                 req_id += 1
                 continue
 
@@ -448,7 +438,7 @@ async def _ws_create_long_lived_token(
 
 
 def _discover_pytest_paths(work_dir: Path) -> list[str]:
-    if (override := os.environ.get("AUTOQA_TEST_PATHS")):
+    if override := os.environ.get("AUTOQA_TEST_PATHS"):
         return shlex.split(override)
 
     paths: list[Path] = []
@@ -470,7 +460,7 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
     work_dir = Path(os.environ.get("AUTOQA_WORK_DIR", "/work"))
 
     config_path: Path | None = None
-    if (override := os.environ.get("AUTOQA_PYTEST_CONFIG")):
+    if override := os.environ.get("AUTOQA_PYTEST_CONFIG"):
         candidate = Path(override)
         config_path = candidate if candidate.is_absolute() else (work_dir / candidate)
     else:
@@ -517,7 +507,7 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
             "no:homeassistant-custom-component",
         ]
 
-    if (extra_args := os.environ.get("AUTOQA_PYTEST_ARGS")):
+    if extra_args := os.environ.get("AUTOQA_PYTEST_ARGS"):
         args += shlex.split(extra_args)
 
     paths = _discover_pytest_paths(work_dir)
