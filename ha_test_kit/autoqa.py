@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -36,6 +36,48 @@ logger:
   default: info
 """
 
+_COVERAGERC_CONTENTS = """\
+[run]
+branch = True
+parallel = True
+concurrency = thread,asyncio
+source = /config/custom_components
+data_file = /config/coverage-data/.coverage
+
+[report]
+exclude_also =
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    \\.\\.\\.
+
+[paths]
+source =
+    /config/custom_components
+    custom_components
+"""
+
+_SITECUSTOMIZE_CONTENTS = '''\
+"""Coverage bootstrap loaded by CPython via the site module.
+
+Present in the HA container via PYTHONPATH=/config/.coverage_pkg.
+Python imports sitecustomize automatically when it appears on sys.path.
+coverage.process_startup() reads COVERAGE_PROCESS_START from env,
+starts tracing, and registers an atexit hook to persist data.
+"""
+import os
+
+if os.environ.get("COVERAGE_PROCESS_START"):
+    try:
+        import coverage
+    except ModuleNotFoundError:
+        # Expected when AUTOQA_COVERAGE=false: seed skipped bootstrap,
+        # but docker-compose env still points COVERAGE_PROCESS_START
+        # at a non-existent file. Silent no-op.
+        pass
+    else:
+        coverage.process_startup()
+'''
+
 
 def _log(message: str) -> None:
     print(f"[autoqa] {message}", flush=True)
@@ -53,6 +95,83 @@ def _normalize_base_url(url: str) -> str:
     if url.endswith("/"):
         url = url[:-1]
     return url
+
+
+def _run_static_checks(work_dir: Path) -> None:
+    """Run ruff (fail-fast) and vulture (warnings-only) before tests.
+
+    Both checks default to enabled; disable with AUTOQA_LINT=false
+    and AUTOQA_VULTURE=false respectively. Paths are computed from
+    what exists under work_dir so the harness stays generic.
+    """
+    pyproject = work_dir / "ha-test-kit" / "pyproject.toml"
+    candidate_targets = ["custom_components", "ha-test-kit/ha_test_kit"]
+    targets = [t for t in candidate_targets if (work_dir / t).is_dir()]
+
+    if _env_bool("AUTOQA_LINT", default=True):
+        if not targets:
+            _log("No lint targets found under /work; skipping ruff")
+        else:
+            _log(f"[ruff] check: {targets}")
+            check_rc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ruff",
+                    "check",
+                    "--config",
+                    str(pyproject),
+                    *targets,
+                ],
+                cwd=work_dir,
+            ).returncode
+            if check_rc != 0:
+                raise SystemExit(f"[ruff] check failed with exit code {check_rc}")
+
+            _log("[ruff] format --check")
+            fmt_rc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ruff",
+                    "format",
+                    "--check",
+                    "--config",
+                    str(pyproject),
+                    *targets,
+                ],
+                cwd=work_dir,
+            ).returncode
+            if fmt_rc != 0:
+                raise SystemExit(f"[ruff-format] check failed with exit code {fmt_rc}")
+
+    if _env_bool("AUTOQA_VULTURE", default=True) and targets:
+        whitelist = Path("/opt/ha_test_kit/ha_test_kit/vulture_whitelist.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "vulture",
+                "--config",
+                str(pyproject),
+                *targets,
+                str(whitelist),
+            ],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+        )
+        output = result.stdout.strip()
+        if output:
+            print(
+                "[vulture] Potential dead code " "(review manually — may contain false positives):",
+                flush=True,
+            )
+            print(output, flush=True)
+        else:
+            _log("[vulture] No findings")
+        # Intentionally ignore exit code: vulture decisions require
+        # human judgment.
 
 
 def _install_component_requirements(work_dir: Path) -> None:
@@ -120,6 +239,7 @@ def _wait_for_ha_ready(base_url: str, timeout_s: int = 180) -> None:
 # ---------------------------------------------------------------------------
 # HA config seeding & package autodiscovery
 # ---------------------------------------------------------------------------
+
 
 def _discover_ha_packages(work_dir: Path) -> list[Path]:
     """Find HA package YAML files from well-known autodiscovery paths.
@@ -190,7 +310,7 @@ def _seed_ha_configuration(ha_config_dir: Path, work_dir: Path) -> None:
 
     # --- Copy .storage registries ------------------------------------------
     # Files that must NOT be seeded — they interfere with onboarding / auth.
-    _STORAGE_SKIP = {
+    storage_skip = {
         "auth",
         "auth_provider.homeassistant",
         "onboarding",
@@ -217,7 +337,7 @@ def _seed_ha_configuration(ha_config_dir: Path, work_dir: Path) -> None:
         for src_file in sorted(src_storage_dir.iterdir()):
             if not src_file.is_file():
                 continue
-            if src_file.name in _STORAGE_SKIP:
+            if src_file.name in storage_skip:
                 _log(f"Skipped seeding .storage/{src_file.name} (auth-related)")
                 continue
             try:
@@ -226,6 +346,47 @@ def _seed_ha_configuration(ha_config_dir: Path, work_dir: Path) -> None:
                 _log(f"Skipped seeding {src_file.name} (permission denied)")
                 continue
             _log(f"Seeded .storage/{src_file.name} (from {src_storage_dir})")
+
+
+def _seed_coverage_bootstrap(ha_config_dir: Path) -> None:
+    """Install coverage.py and sitecustomize into the HA config volume.
+
+    Runs inside the seed container, which has pip and network access.
+    The HA container then loads these artefacts through PYTHONPATH and
+    COVERAGE_PROCESS_START without needing coverage pre-installed in
+    its own site-packages.
+    """
+    if not _env_bool("AUTOQA_COVERAGE", default=True):
+        _log("AUTOQA_COVERAGE=false; skipping coverage bootstrap")
+        return
+
+    pkg_dir = ha_config_dir / ".coverage_pkg"
+    data_dir = ha_config_dir / "coverage-data"
+    coveragerc = ha_config_dir / ".coveragerc"
+    sitecustomize = pkg_dir / "sitecustomize.py"
+
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    _log(f"Installing coverage into {pkg_dir}")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-input",
+            "--no-cache-dir",
+            "--target",
+            str(pkg_dir),
+            "coverage==7.6.*",
+        ],
+        check=True,
+    )
+
+    coveragerc.write_text(_COVERAGERC_CONTENTS, encoding="utf-8")
+    sitecustomize.write_text(_SITECUSTOMIZE_CONTENTS, encoding="utf-8")
+    _log(f"Coverage bootstrap ready at {pkg_dir}, rc={coveragerc}")
 
 
 def _touch_ready_flag(ha_config_dir: Path) -> None:
@@ -271,9 +432,7 @@ def _create_onboarding_user(
         _log(f"Onboarding unavailable (status {resp.status_code}); will use login_flow fallback")
         return None
 
-    raise RuntimeError(
-        f"Failed to create onboarding user: status={resp.status_code} body={resp.text}"
-    )
+    raise RuntimeError(f"Failed to create onboarding user: status={resp.status_code} body={resp.text}")
 
 
 def _login_flow_auth_code(
@@ -353,9 +512,7 @@ def _login_flow_auth_code(
     return str(auth_code)
 
 
-def _exchange_auth_code_for_access_token(
-    base_url: str, *, client_id: str, auth_code: str
-) -> str:
+def _exchange_auth_code_for_access_token(base_url: str, *, client_id: str, auth_code: str) -> str:
     base_url = _normalize_base_url(base_url)
 
     resp = requests.post(
@@ -407,11 +564,7 @@ async def _ws_create_long_lived_token(
         req_id = 1
         last_result: dict[str, object] | None = None
         for attempt in range(6):
-            actual_client_name = (
-                client_name
-                if attempt == 0
-                else f"{client_name}-{int(time.time())}-{attempt}"
-            )
+            actual_client_name = client_name if attempt == 0 else f"{client_name}-{int(time.time())}-{attempt}"
 
             await ws.send(
                 json.dumps(
@@ -435,10 +588,7 @@ async def _ws_create_long_lived_token(
                 return str(token)
 
             if attempt < 5:
-                _log(
-                    "LLAT creation failed; retrying with different client_name: "
-                    + str(token_result)
-                )
+                _log("LLAT creation failed; retrying with different client_name: " + str(token_result))
                 req_id += 1
                 continue
 
@@ -448,7 +598,7 @@ async def _ws_create_long_lived_token(
 
 
 def _discover_pytest_paths(work_dir: Path) -> list[str]:
-    if (override := os.environ.get("AUTOQA_TEST_PATHS")):
+    if override := os.environ.get("AUTOQA_TEST_PATHS"):
         return shlex.split(override)
 
     paths: list[Path] = []
@@ -470,7 +620,7 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
     work_dir = Path(os.environ.get("AUTOQA_WORK_DIR", "/work"))
 
     config_path: Path | None = None
-    if (override := os.environ.get("AUTOQA_PYTEST_CONFIG")):
+    if override := os.environ.get("AUTOQA_PYTEST_CONFIG"):
         candidate = Path(override)
         config_path = candidate if candidate.is_absolute() else (work_dir / candidate)
     else:
@@ -503,6 +653,17 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
 
     if mode == "unit":
         args += ["-m", "not docker_e2e"]
+        if _env_bool("AUTOQA_COVERAGE", default=True):
+            cov_out = work_dir / ".autoqa" / "coverage" / "unit"
+            cov_out.mkdir(parents=True, exist_ok=True)
+            args += [
+                "--cov=custom_components",
+                "--cov-branch",
+                "--cov-report=term-missing",
+                f"--cov-report=html:{cov_out / 'html'}",
+                f"--cov-report=xml:{cov_out / 'coverage.xml'}",
+            ]
+            extra_env["COVERAGE_FILE"] = str(cov_out / ".coverage")
     elif mode == "e2e":
         args += ["-m", "docker_e2e"]
     else:
@@ -517,7 +678,7 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
             "no:homeassistant-custom-component",
         ]
 
-    if (extra_args := os.environ.get("AUTOQA_PYTEST_ARGS")):
+    if extra_args := os.environ.get("AUTOQA_PYTEST_ARGS"):
         args += shlex.split(extra_args)
 
     paths = _discover_pytest_paths(work_dir)
@@ -534,22 +695,103 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
     return int(proc.returncode)
 
 
+def _finalize_e2e_coverage(
+    base_url: str,
+    access_token: str,
+    ha_config_dir: Path,
+    out_dir: Path,
+) -> None:
+    """Stop HA gracefully, wait for .coverage.* fragments, combine them.
+
+    autoqa must not exit before HA has flushed its coverage data to
+    the shared volume; otherwise compose's --abort-on-container-exit
+    tears down the HA container before its atexit hook runs. This
+    function coordinates the shutdown explicitly.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = ha_config_dir / "coverage-data"
+
+    _log("[coverage] Requesting HA shutdown via core.stop")
+    try:
+        requests.post(
+            f"{base_url}/api/services/homeassistant/stop",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"[coverage] HA core.stop failed: {exc}") from exc
+
+    deadline = time.time() + 30
+    fragments: list[Path] = []
+    while time.time() < deadline:
+        fragments = list(data_dir.glob(".coverage.*"))
+        if fragments:
+            break
+        time.sleep(0.5)
+
+    if not fragments:
+        raise RuntimeError(
+            f"[coverage] No .coverage.* fragments appeared in {data_dir} "
+            "within 30s of HA core.stop. Check that COVERAGE_PROCESS_START "
+            "is set on the homeassistant service and that "
+            "/config/.coverage_pkg/sitecustomize.py is importable."
+        )
+
+    # Grace period for late writes.
+    time.sleep(2)
+
+    for frag in data_dir.glob(".coverage.*"):
+        shutil.copyfile(frag, out_dir / frag.name)
+
+    _log(f"[coverage] Combining {len(fragments)} fragment(s) into {out_dir}")
+    cov_env = {**os.environ, "COVERAGE_RCFILE": str(ha_config_dir / ".coveragerc")}
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "combine"],
+        cwd=out_dir,
+        check=True,
+        env=cov_env,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "report", "--show-missing"],
+        cwd=out_dir,
+        check=True,
+        env=cov_env,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "html", "-d", str(out_dir / "html")],
+        cwd=out_dir,
+        check=True,
+        env=cov_env,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "xml", "-o", str(out_dir / "coverage.xml")],
+        cwd=out_dir,
+        check=True,
+        env=cov_env,
+    )
+
+
 def main() -> int:
     mode = os.environ.get("AUTOQA_MODE", "unit").strip().lower()
 
     work_dir = Path(os.environ.get("AUTOQA_WORK_DIR", "/work"))
+
+    if mode in ("unit", "e2e"):
+        _run_static_checks(work_dir)
 
     _install_component_requirements(work_dir)
 
     if mode == "seed":
         ha_config_dir = Path(os.environ.get("HA_CONFIG_DIR", "/ha_config"))
         _seed_ha_configuration(ha_config_dir, work_dir)
+        _seed_coverage_bootstrap(ha_config_dir)
         _touch_ready_flag(ha_config_dir)
         return 0
 
     if mode == "e2e":
         ha_config_dir = Path(os.environ.get("HA_CONFIG_DIR", "/ha_config"))
         _seed_ha_configuration(ha_config_dir, work_dir)
+        _seed_coverage_bootstrap(ha_config_dir)
         _touch_ready_flag(ha_config_dir)
 
         base_url = os.environ.get("HA_BASE_URL", "http://homeassistant:8123")
@@ -601,7 +843,17 @@ def main() -> int:
             "HA_CONFIG_DIR": str(ha_config_dir),
         }
 
-        return _run_pytest(mode=mode, extra_env=extra_env)
+        pytest_rc = _run_pytest(mode=mode, extra_env=extra_env)
+
+        if _env_bool("AUTOQA_COVERAGE", default=True):
+            _finalize_e2e_coverage(
+                base_url=base_url,
+                access_token=llat,
+                ha_config_dir=ha_config_dir,
+                out_dir=work_dir / ".autoqa" / "coverage" / "e2e",
+            )
+
+        return pytest_rc
 
     if mode == "unit":
         extra_env = {

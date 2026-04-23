@@ -13,3 +13,44 @@ markers = [
   "e2e: marks tests as end-to-end tests (require running HA instance)",
   "docker_e2e: marks tests requiring a real HA instance in Docker (ha-test-kit)",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+extend-exclude = [
+    ".autoqa",
+    ".venv",
+    "venv",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes (unused imports, undefined names)
+    "I",    # isort (import order)
+    "B",    # flake8-bugbear (antipatterns)
+    "UP",   # pyupgrade (modern Python)
+    "N",    # pep8-naming
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",   # line-too-long handled by ruff format
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["F401", "F811"]
+"custom_components/**" = ["B008"]
+"**/vulture_whitelist.py" = ["B018", "F821"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.vulture]
+exclude = ["*/tests/*"]
+min_confidence = 60
+ignore_decorators = ["@pytest.fixture", "@callback", "@staticmethod", "@property"]
+sort_by_size = true

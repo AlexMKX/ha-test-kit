@@ -20,6 +20,10 @@ RUN python -m pip install \
       "homeassistant==${HA_VERSION}" \
       pytest \
       pytest-asyncio \
+      "pytest-cov==5.0.*" \
+      "coverage==7.6.*" \
+      "ruff==0.6.*" \
+      "vulture==2.14" \
       requests \
       websockets \
       playwright
