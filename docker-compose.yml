@@ -28,6 +28,8 @@ services:
       - ./custom_components:/config/custom_components:ro
     environment:
       - TZ=UTC
+      - COVERAGE_PROCESS_START=/config/.coveragerc
+      - PYTHONPATH=/config/.coverage_pkg
     networks:
       - e2e_network
 
@@ -41,6 +43,7 @@ services:
       - homeassistant
     volumes:
       - .:/work:ro
+      - ./.autoqa:/work/.autoqa
       - ha_config:/ha_config
       - ./.autoqa/test_results:/test_results
       - ./.autoqa/screenshots:/screenshots
