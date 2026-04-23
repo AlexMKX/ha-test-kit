@@ -58,6 +58,108 @@ It supports two modes:
 
 ---
 
+## Static analysis (ruff + vulture)
+
+Every unit and e2e run begins with two static checks, both enabled by default.
+
+**ruff** (fail-fast): lint + format check on `custom_components/` and
+`ha-test-kit/ha_test_kit/`. Violations block the rest of the run.
+Configuration lives in `ha-test-kit/pyproject.toml` under
+`[tool.ruff]` / `[tool.ruff.lint]` / `[tool.ruff.format]`. The rule
+set is `E, W, F, I, B, UP, N, SIM` with `E501` delegated to the
+formatter.
+
+**vulture** (warnings-only): dead-code analysis on the same scope.
+Output is prefixed with `[vulture]` in stdout and never blocks the
+run — vulture produces false positives on HA framework conventions
+(async_setup_entry, _attr_*, etc.), most of which are suppressed by
+a built-in whitelist at `ha-test-kit/ha_test_kit/vulture_whitelist.py`.
+Consumer-specific dead code still surfaces.
+
+Disable independently:
+
+```bash
+AUTOQA_LINT=false ./ha-test-kit/run_unit.sh
+AUTOQA_VULTURE=false ./ha-test-kit/run_unit.sh
+```
+
+To auto-fix ruff issues locally (not invoked by the harness):
+
+```bash
+docker run --rm -v "$(pwd):/work" -w /work autoqa-unit \
+  ruff check --fix --config /work/ha-test-kit/pyproject.toml custom_components
+docker run --rm -v "$(pwd):/work" -w /work autoqa-unit \
+  ruff format --config /work/ha-test-kit/pyproject.toml custom_components
+```
+
+---
+
+## Coverage
+
+pytest-cov is enabled by default for both unit and e2e modes.
+Reports land in `.autoqa/coverage/` on the host.
+
+**Unit mode** — pytest-cov runs inside the autoqa container,
+instrumenting `custom_components/` during the normal pytest
+invocation. Output:
+
+- `.autoqa/coverage/unit/.coverage` — raw coverage data
+- `.autoqa/coverage/unit/coverage.xml` — Cobertura XML (for CI)
+- `.autoqa/coverage/unit/html/index.html` — interactive HTML report
+- Terminal: `term-missing` summary with uncovered line numbers
+
+**E2E mode** — the integration code runs inside the Home Assistant
+container, not inside autoqa. Coverage is collected there via a
+three-part mechanism:
+
+1. **seed phase**: installs `coverage==7.6.*` into
+   `/ha_config/.coverage_pkg` on a shared volume and writes
+   `.coveragerc` + `sitecustomize.py`.
+2. **HA runtime**: `docker-compose.yml` sets
+   `PYTHONPATH=/config/.coverage_pkg` and
+   `COVERAGE_PROCESS_START=/config/.coveragerc` on the `homeassistant`
+   service. Python's `site` module imports `sitecustomize.py` at
+   startup, which calls `coverage.process_startup()` — tracing begins
+   before any HA code runs.
+3. **finalize**: after pytest completes, autoqa calls HA's
+   `/api/services/homeassistant/stop` to trigger a graceful shutdown,
+   polls `/ha_config/coverage-data/` for the `.coverage.*` fragments
+   HA writes on exit, then runs `coverage combine` + generates
+   HTML/XML reports.
+
+Output locations mirror unit mode: `.autoqa/coverage/e2e/` instead of
+`.../unit/`. The `[paths]` remap in `.coveragerc` rewrites HA's
+`/config/custom_components/...` paths to the consumer's repo-relative
+`custom_components/...` so reports are readable from the host.
+
+**Disable:**
+
+```bash
+AUTOQA_COVERAGE=false ./ha-test-kit/run_unit.sh
+AUTOQA_COVERAGE=false ./ha-test-kit/run_e2e.sh
+```
+
+**Merge unit + e2e into a single combined report** (not automated):
+
+```bash
+coverage combine \
+  .autoqa/coverage/unit/.coverage \
+  .autoqa/coverage/e2e/.coverage
+coverage html -d .autoqa/coverage/combined/html
+```
+
+**Failure modes** (all fail-fast when coverage is on):
+
+- Zero `.coverage.*` fragments after HA shutdown → `RuntimeError`,
+  typically caused by missing `COVERAGE_PROCESS_START` env.
+- `coverage combine` failure → `CalledProcessError` from coverage.
+- HA unreachable via `core.stop` → `RuntimeError`.
+
+If pytest also failed in the same run, the coverage error wins — it
+signals infrastructure breakage, which invalidates every test result.
+
+---
+
 ## Repo conventions the harness relies on
 
 ### 1) HA packages autodiscovery
@@ -196,6 +298,16 @@ AUTOQA_PYTEST_ARGS="-vv --maxfail=1" ./ha-test-kit/run_e2e.sh
 - `AUTOQA_ENABLE_HA_PYTEST_PLUGIN`
   - If `true`, does not disable HA pytest plugins.
   - Default is `false` (the harness adds `-p no:pytest_homeassistant_custom_component` etc.).
+
+- `AUTOQA_LINT`
+  - Default: `true`. Set to `false` to skip ruff check and format.
+
+- `AUTOQA_VULTURE`
+  - Default: `true`. Set to `false` to skip vulture.
+
+- `AUTOQA_COVERAGE`
+  - Default: `true`. Set to `false` to skip pytest-cov in unit and
+    coverage bootstrap + finalize in e2e.
 
 ### E2E / Home Assistant
 
