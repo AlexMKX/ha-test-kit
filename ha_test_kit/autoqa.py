@@ -570,6 +570,17 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
 
     if mode == "unit":
         args += ["-m", "not docker_e2e"]
+        if _env_bool("AUTOQA_COVERAGE", default=True):
+            cov_out = work_dir / ".autoqa" / "coverage" / "unit"
+            cov_out.mkdir(parents=True, exist_ok=True)
+            args += [
+                "--cov=custom_components",
+                "--cov-branch",
+                "--cov-report=term-missing",
+                f"--cov-report=html:{cov_out / 'html'}",
+                f"--cov-report=xml:{cov_out / 'coverage.xml'}",
+            ]
+            extra_env["COVERAGE_FILE"] = str(cov_out / ".coverage")
     elif mode == "e2e":
         args += ["-m", "docker_e2e"]
     else:
