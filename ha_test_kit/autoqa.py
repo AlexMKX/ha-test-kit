@@ -695,6 +695,82 @@ def _run_pytest(*, mode: str, extra_env: dict[str, str]) -> int:
     return int(proc.returncode)
 
 
+def _finalize_e2e_coverage(
+    base_url: str,
+    access_token: str,
+    ha_config_dir: Path,
+    out_dir: Path,
+) -> None:
+    """Stop HA gracefully, wait for .coverage.* fragments, combine them.
+
+    autoqa must not exit before HA has flushed its coverage data to
+    the shared volume; otherwise compose's --abort-on-container-exit
+    tears down the HA container before its atexit hook runs. This
+    function coordinates the shutdown explicitly.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = ha_config_dir / "coverage-data"
+
+    _log("[coverage] Requesting HA shutdown via core.stop")
+    try:
+        requests.post(
+            f"{base_url}/api/services/homeassistant/stop",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"[coverage] HA core.stop failed: {exc}") from exc
+
+    deadline = time.time() + 30
+    fragments: list[Path] = []
+    while time.time() < deadline:
+        fragments = list(data_dir.glob(".coverage.*"))
+        if fragments:
+            break
+        time.sleep(0.5)
+
+    if not fragments:
+        raise RuntimeError(
+            f"[coverage] No .coverage.* fragments appeared in {data_dir} "
+            "within 30s of HA core.stop. Check that COVERAGE_PROCESS_START "
+            "is set on the homeassistant service and that "
+            "/config/.coverage_pkg/sitecustomize.py is importable."
+        )
+
+    # Grace period for late writes.
+    time.sleep(2)
+
+    for frag in data_dir.glob(".coverage.*"):
+        shutil.copyfile(frag, out_dir / frag.name)
+
+    _log(f"[coverage] Combining {len(fragments)} fragment(s) into {out_dir}")
+    cov_env = {**os.environ, "COVERAGE_RCFILE": str(ha_config_dir / ".coveragerc")}
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "combine"],
+        cwd=out_dir,
+        check=True,
+        env=cov_env,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "report", "--show-missing"],
+        cwd=out_dir,
+        check=True,
+        env=cov_env,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "html", "-d", str(out_dir / "html")],
+        cwd=out_dir,
+        check=True,
+        env=cov_env,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "xml", "-o", str(out_dir / "coverage.xml")],
+        cwd=out_dir,
+        check=True,
+        env=cov_env,
+    )
+
+
 def main() -> int:
     mode = os.environ.get("AUTOQA_MODE", "unit").strip().lower()
 
@@ -767,7 +843,17 @@ def main() -> int:
             "HA_CONFIG_DIR": str(ha_config_dir),
         }
 
-        return _run_pytest(mode=mode, extra_env=extra_env)
+        pytest_rc = _run_pytest(mode=mode, extra_env=extra_env)
+
+        if _env_bool("AUTOQA_COVERAGE", default=True):
+            _finalize_e2e_coverage(
+                base_url=base_url,
+                access_token=llat,
+                ha_config_dir=ha_config_dir,
+                out_dir=work_dir / ".autoqa" / "coverage" / "e2e",
+            )
+
+        return pytest_rc
 
     if mode == "unit":
         extra_env = {
