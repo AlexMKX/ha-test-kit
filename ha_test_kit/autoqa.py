@@ -36,6 +36,48 @@ logger:
   default: info
 """
 
+_COVERAGERC_CONTENTS = """\
+[run]
+branch = True
+parallel = True
+concurrency = thread,asyncio
+source = /config/custom_components
+data_file = /config/coverage-data/.coverage
+
+[report]
+exclude_also =
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    \\.\\.\\.
+
+[paths]
+source =
+    /config/custom_components
+    custom_components
+"""
+
+_SITECUSTOMIZE_CONTENTS = '''\
+"""Coverage bootstrap loaded by CPython via the site module.
+
+Present in the HA container via PYTHONPATH=/config/.coverage_pkg.
+Python imports sitecustomize automatically when it appears on sys.path.
+coverage.process_startup() reads COVERAGE_PROCESS_START from env,
+starts tracing, and registers an atexit hook to persist data.
+"""
+import os
+
+if os.environ.get("COVERAGE_PROCESS_START"):
+    try:
+        import coverage
+    except ModuleNotFoundError:
+        # Expected when AUTOQA_COVERAGE=false: seed skipped bootstrap,
+        # but docker-compose env still points COVERAGE_PROCESS_START
+        # at a non-existent file. Silent no-op.
+        pass
+    else:
+        coverage.process_startup()
+'''
+
 
 def _log(message: str) -> None:
     print(f"[autoqa] {message}", flush=True)
@@ -304,6 +346,47 @@ def _seed_ha_configuration(ha_config_dir: Path, work_dir: Path) -> None:
                 _log(f"Skipped seeding {src_file.name} (permission denied)")
                 continue
             _log(f"Seeded .storage/{src_file.name} (from {src_storage_dir})")
+
+
+def _seed_coverage_bootstrap(ha_config_dir: Path) -> None:
+    """Install coverage.py and sitecustomize into the HA config volume.
+
+    Runs inside the seed container, which has pip and network access.
+    The HA container then loads these artefacts through PYTHONPATH and
+    COVERAGE_PROCESS_START without needing coverage pre-installed in
+    its own site-packages.
+    """
+    if not _env_bool("AUTOQA_COVERAGE", default=True):
+        _log("AUTOQA_COVERAGE=false; skipping coverage bootstrap")
+        return
+
+    pkg_dir = ha_config_dir / ".coverage_pkg"
+    data_dir = ha_config_dir / "coverage-data"
+    coveragerc = ha_config_dir / ".coveragerc"
+    sitecustomize = pkg_dir / "sitecustomize.py"
+
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    _log(f"Installing coverage into {pkg_dir}")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-input",
+            "--no-cache-dir",
+            "--target",
+            str(pkg_dir),
+            "coverage==7.6.*",
+        ],
+        check=True,
+    )
+
+    coveragerc.write_text(_COVERAGERC_CONTENTS, encoding="utf-8")
+    sitecustomize.write_text(_SITECUSTOMIZE_CONTENTS, encoding="utf-8")
+    _log(f"Coverage bootstrap ready at {pkg_dir}, rc={coveragerc}")
 
 
 def _touch_ready_flag(ha_config_dir: Path) -> None:
@@ -625,12 +708,14 @@ def main() -> int:
     if mode == "seed":
         ha_config_dir = Path(os.environ.get("HA_CONFIG_DIR", "/ha_config"))
         _seed_ha_configuration(ha_config_dir, work_dir)
+        _seed_coverage_bootstrap(ha_config_dir)
         _touch_ready_flag(ha_config_dir)
         return 0
 
     if mode == "e2e":
         ha_config_dir = Path(os.environ.get("HA_CONFIG_DIR", "/ha_config"))
         _seed_ha_configuration(ha_config_dir, work_dir)
+        _seed_coverage_bootstrap(ha_config_dir)
         _touch_ready_flag(ha_config_dir)
 
         base_url = os.environ.get("HA_BASE_URL", "http://homeassistant:8123")
