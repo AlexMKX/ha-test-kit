@@ -55,6 +55,83 @@ def _normalize_base_url(url: str) -> str:
     return url
 
 
+def _run_static_checks(work_dir: Path) -> None:
+    """Run ruff (fail-fast) and vulture (warnings-only) before tests.
+
+    Both checks default to enabled; disable with AUTOQA_LINT=false
+    and AUTOQA_VULTURE=false respectively. Paths are computed from
+    what exists under work_dir so the harness stays generic.
+    """
+    pyproject = work_dir / "ha-test-kit" / "pyproject.toml"
+    candidate_targets = ["custom_components", "ha-test-kit/ha_test_kit"]
+    targets = [t for t in candidate_targets if (work_dir / t).is_dir()]
+
+    if _env_bool("AUTOQA_LINT", default=True):
+        if not targets:
+            _log("No lint targets found under /work; skipping ruff")
+        else:
+            _log(f"[ruff] check: {targets}")
+            check_rc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ruff",
+                    "check",
+                    "--config",
+                    str(pyproject),
+                    *targets,
+                ],
+                cwd=work_dir,
+            ).returncode
+            if check_rc != 0:
+                raise SystemExit(f"[ruff] check failed with exit code {check_rc}")
+
+            _log("[ruff] format --check")
+            fmt_rc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ruff",
+                    "format",
+                    "--check",
+                    "--config",
+                    str(pyproject),
+                    *targets,
+                ],
+                cwd=work_dir,
+            ).returncode
+            if fmt_rc != 0:
+                raise SystemExit(f"[ruff-format] check failed with exit code {fmt_rc}")
+
+    if _env_bool("AUTOQA_VULTURE", default=True) and targets:
+        whitelist = Path("/opt/ha_test_kit/ha_test_kit/vulture_whitelist.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "vulture",
+                "--config",
+                str(pyproject),
+                *targets,
+                str(whitelist),
+            ],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+        )
+        output = result.stdout.strip()
+        if output:
+            print(
+                "[vulture] Potential dead code " "(review manually — may contain false positives):",
+                flush=True,
+            )
+            print(output, flush=True)
+        else:
+            _log("[vulture] No findings")
+        # Intentionally ignore exit code: vulture decisions require
+        # human judgment.
+
+
 def _install_component_requirements(work_dir: Path) -> None:
     if not _env_bool("AUTOQA_INSTALL_COMPONENT_REQUIREMENTS", default=True):
         return
@@ -528,6 +605,9 @@ def main() -> int:
     mode = os.environ.get("AUTOQA_MODE", "unit").strip().lower()
 
     work_dir = Path(os.environ.get("AUTOQA_WORK_DIR", "/work"))
+
+    if mode in ("unit", "e2e"):
+        _run_static_checks(work_dir)
 
     _install_component_requirements(work_dir)
 

@@ -42,6 +42,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["F401", "F811"]
 "custom_components/**" = ["B008"]
+"**/vulture_whitelist.py" = ["B018", "F821"]
 
 [tool.ruff.format]
 quote-style = "double"
